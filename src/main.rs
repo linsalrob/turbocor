@@ -1,6 +1,6 @@
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::mem::transmute;
 use std::ops::Add;
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ use std::arch::x86_64::{
     _mm256_extractf128_ps,
     _mm256_fmadd_ps,
     _mm256_set1_ps,
+    _mm256_set_ps,
     _mm256_testc_si256,
     _mm_add_ps,
     _mm_cvtss_f32,
@@ -23,6 +24,10 @@ use std::arch::x86_64::{
 
 extern crate byteorder;
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
+
+extern crate indicatif;
+// use indicatif::{ProgressIterator, ParallelProgressIterator};
+use indicatif::ProgressIterator;
 
 extern crate thread_local;
 use thread_local::ThreadLocal;
@@ -38,9 +43,10 @@ struct F32x8 {
 
 impl F32x8 {
     fn from_slice(xs: &[f32; 8]) -> Self {
-        return F32x8{x: unsafe { *transmute::<&[f32; 8], &__m256>(xs) } };
+        // this segfault, not sure why
+        // return F32x8{x: unsafe { *transmute::<&[f32; 8], &__m256>(xs) } };
+        return F32x8{x: unsafe { _mm256_set_ps(xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]) } };
     }
-
 
     // Fused multiply-add computing self*v + b
     fn fma(&self, v: &Self, b: &Self) -> F32x8 {
@@ -100,29 +106,30 @@ use ndarray::parallel::prelude::*;
 
 
 // Read HDF5 feature matrix into a padded AVX (F32x8) matrix.
-fn read_feature_matrix(filename: &str) -> hdf5::Result<Array2<F32x8>> {
+fn read_feature_matrix(filename: &str) -> hdf5::Result<(Array2<F32x8>, usize, usize)> {
     let file = hdf5::File::open(filename)?;
-    let Xds = file.dataset("X")?;
+    let x_ds = file.dataset("X")?;
 
-    let X = Xds.read_2d::<f32>()?;
+    let x = x_ds.read_2d::<f32>()?;
 
     // TODO: we have to do some normalization stuff for this to work. What was it?
 
-    let m = X.shape()[0];
-    let n = X.shape()[1];
+    let m = x.shape()[0];
+    let n = x.shape()[1];
 
     // Pad and convert to a f32x8 matrix
     let n_avx = ((n-1) / 8)+1;
-    let mut X_avx = Array2::<F32x8>::zeros((m, n_avx));
+    dbg!(n_avx);
+    let mut x_avx = Array2::<F32x8>::zeros((m, n_avx));
     let mut buf: [f32; 8] = [0.0; 8];
 
-    for (i, row) in X.outer_iter().enumerate() {
+    for (i, row) in x.outer_iter().enumerate() {
         let mut k = 0;
         for (j, value) in row.iter().enumerate() {
             k = j % 8;
             buf[k] = *value;
             if k == 7 {
-                X_avx[[i, j/8]] = F32x8::from_slice(&buf);
+                x_avx[[i, j/8]] = F32x8::from_slice(&buf);
             }
         }
 
@@ -131,11 +138,11 @@ fn read_feature_matrix(filename: &str) -> hdf5::Result<Array2<F32x8>> {
             for l in k+1..8 {
                 buf[l] = 0.0;
             }
-            X_avx[[i, (n-1)/8]] = F32x8::from_slice(&buf);
+            x_avx[[i, (n-1)/8]] = F32x8::from_slice(&buf);
         }
     }
 
-    return Ok(X_avx);
+    return Ok((x_avx, m, n));
 }
 
 
@@ -152,7 +159,7 @@ fn correlation_matrix(X: &Array2<F32x8>, tmpfile: &mut File, lower_bound: f32) -
 
     // Each thread adds results to its own buffer. When a buffer is full, it locks
     // the temporary file and purges its buffer.
-    const BUFSIZE: usize = 10000;
+    const BUFSIZE: usize = 1_000_000;
     let buffers: Arc<ThreadLocal<Mutex<Vec<(i32, i32, f32)>>>> = Arc::new(ThreadLocal::new());
     let tmpfile = Arc::new(Mutex::new(tmpfile));
 
@@ -179,31 +186,24 @@ fn correlation_matrix(X: &Array2<F32x8>, tmpfile: &mut File, lower_bound: f32) -
             buffer.push((i as i32, j as i32, c));
             if buffer.len() >= BUFSIZE {
                 let mut tmpfile = tmpfile.lock().unwrap();
-                for (i, j, v) in buffer.iter() {
-                    tmpfile.write_i32::<BigEndian>(*i).unwrap();
-                    tmpfile.write_i32::<BigEndian>(*j).unwrap();
-                    tmpfile.write_f32::<BigEndian>(*v).unwrap();
-                }
+                write_temporary_entries(*tmpfile, &buffer);
                 buffer.clear();
             }
         })
     });
 
     // handle partially filled buffers
+    println!("flushing buffers...");
     let mut tmpfile = tmpfile.lock().unwrap();
     let buffers = Arc::try_unwrap(buffers).unwrap();
     let mut buffer_count = 0;
     buffers.into_iter().for_each(|buffer| {
         buffer_count += 1;
         let mut buffer = buffer.lock().unwrap();
-            for (i, j, v) in buffer.iter() {
-                tmpfile.write_i32::<BigEndian>(*i).unwrap();
-                tmpfile.write_i32::<BigEndian>(*j).unwrap();
-                tmpfile.write_f32::<BigEndian>(*v).unwrap();
-            }
-            buffer.clear();
+        write_temporary_entries(*tmpfile, &buffer);
+        buffer.clear();
     });
-    dbg!(buffer_count);
+    println!("done.");
 
     tmpfile.flush().unwrap();
     tmpfile.seek(SeekFrom::Start(0)).unwrap();
@@ -214,32 +214,52 @@ fn correlation_matrix(X: &Array2<F32x8>, tmpfile: &mut File, lower_bound: f32) -
     assert!(filebytes % bytes_per_entry == 0);
     let nnz = filebytes / bytes_per_entry;
 
-    let mut Is = Vec::<i32>::with_capacity(nnz);
-    let mut Js = Vec::<i32>::with_capacity(nnz);
-    let mut Vs = Vec::<f32>::with_capacity(nnz);
+    return read_temporary_entries(*tmpfile, nnz);
+}
 
+
+fn read_temporary_entries(input: &mut File, nnz: usize) -> (Vec<i32>, Vec<i32>, Vec<f32>) {
+    let mut input = BufReader::new(input);
+
+    let mut i_idx = Vec::<i32>::with_capacity(nnz);
+    let mut j_idx = Vec::<i32>::with_capacity(nnz);
+    let mut v_idx = Vec::<f32>::with_capacity(nnz);
+
+    println!("reading back {} matrix entries...", nnz);
     for _ in 0..nnz {
-        Is.push(tmpfile.read_i32::<BigEndian>().unwrap());
-        Js.push(tmpfile.read_i32::<BigEndian>().unwrap());
-        Vs.push(tmpfile.read_f32::<BigEndian>().unwrap());
+        i_idx.push(input.read_i32::<BigEndian>().unwrap());
+        j_idx.push(input.read_i32::<BigEndian>().unwrap());
+        v_idx.push(input.read_f32::<BigEndian>().unwrap());
     }
+    println!("done.");
 
-    return (Is, Js, Vs);
+    return (i_idx, j_idx, v_idx);
+}
+
+
+fn write_temporary_entries(output: &mut File, buffer: &Vec<(i32, i32, f32)>) {
+    let mut output = BufWriter::new(output);
+
+    for (i, j, v) in buffer.iter() {
+        output.write_i32::<BigEndian>(*i).unwrap();
+        output.write_i32::<BigEndian>(*j).unwrap();
+        output.write_f32::<BigEndian>(*v).unwrap();
+    }
 }
 
 
 // Output correlation matrix in COO format to an HDF5 file
-fn write_correlation_matrix(filename: &str, Is: &Vec<i32>, Js: &Vec<i32>, Vs: &Vec<f32>) -> hdf5::Result<()>  {
-    assert!(Is.len() == Js.len());
-    assert!(Js.len() == Vs.len());
-    let nnz = Is.len();
+fn write_correlation_matrix(filename: &str, i_idx: &Vec<i32>, j_idx: &Vec<i32>, v_idx: &Vec<f32>) -> hdf5::Result<()>  {
+    assert!(i_idx.len() == j_idx.len());
+    assert!(j_idx.len() == v_idx.len());
+    let nnz = i_idx.len();
     let output = hdf5::File::create(filename)?;
     let i_ds = output.new_dataset::<i32>().create("I", nnz)?;
-    i_ds.write(Is)?;
+    i_ds.write(i_idx)?;
     let j_ds = output.new_dataset::<i32>().create("J", nnz)?;
-    j_ds.write(Js)?;
+    j_ds.write(j_idx)?;
     let v_ds = output.new_dataset::<f32>().create("V", nnz)?;
-    v_ds.write(Vs)?;
+    v_ds.write(v_idx)?;
 
     return Ok(());
 }
@@ -279,7 +299,9 @@ fn main() {
     if let Some(matches) = matches.subcommand_matches("compute") {
         let input_filename = matches.value_of("input").unwrap();
         let output_filename = matches.value_of("output").unwrap();
-        let lower_bound = matches.value_of("lower-bound").unwrap().parse::<f32>().unwrap();
+        let lower_bound = matches.value_of("lower-bound").unwrap_or("0.8").parse::<f32>().unwrap();
+
+        println!("lower bound: {}", lower_bound);
 
         // TODO: handle --threads option
 
@@ -289,10 +311,12 @@ fn main() {
             tempfile().unwrap()
         };
 
-        let X = read_feature_matrix(input_filename).unwrap();
+        println!("here");
+        let (x, m, n) = read_feature_matrix(input_filename).unwrap();
+        println!("Input matrix: {} features, {} observations", m, n);
 
-        let (Is, Js, Vs) = correlation_matrix(&X, &mut tmpfile, lower_bound);
-        write_correlation_matrix(output_filename, Is, Js, Vs);
+        let (i_idx, j_idx, v_idx) = correlation_matrix(&x, &mut tmpfile, lower_bound);
+        write_correlation_matrix(output_filename, &i_idx, &j_idx, &v_idx).unwrap();
 
     } else if let Some(matches) = matches.subcommand_matches("topk") {
         // TODO:
@@ -302,6 +326,4 @@ fn main() {
     } else {
         // TODO: error
     }
-
-    println!("Hello, world!");
 }
