@@ -6,13 +6,16 @@ efficiently as possible.
 
 The main ideas are thus:
 
-    1. Pairwise correlations computed using AVX2 and FMA instructions.
-    2. Multithreading, of course.
-    3. Save space by not keeping correlations (with absolute value) below some threshold. (Hense, "sparse" correlation matrix.)
-    4. Use constant space and avoid overhead from reallocation by writing matrix
-    entries to a file buffer.
-    5. Find the top-`k` correlations using partial sort taking `O(n^2 + k log(k))`
+1. Pairwise correlations computed using AVX2 and FMA instructions.
+2. Multithreading, of course.
+3. Save space by discarding correlations with absolute value below some threshold. (Hense, "sparse" correlation matrix.)
+4. Use constant space and avoid thread contention and overhead from reallocation by using
+thread local buffers which are dumped to a temporary file when full.
+5. Find the top-`k` correlations using partial sort taking `O(n^2 + k log(k))`
     time, rather than full sort taking `O(n^2 log(n))` time.
+
+Combined, this lets you compute a correlation network in ~10min and 10GB
+memory that would ordinary take a day and hundreds of GBs.
 
 ## Usage
 
