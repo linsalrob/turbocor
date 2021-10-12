@@ -309,8 +309,7 @@ fn read_correlation_matrix(filename: &str) -> hdf5::Result<(Vec<i32>, Vec<i32>, 
 
 
 fn main() {
-    // TODO: What are we actually calling this thing?
-    let matches = App::new("")
+    let matches = App::new("turbocor")
         .about("Brute-force computation of correlation matrices.")
         .setting(AppSettings::ArgRequiredElseHelp)
         .subcommand(SubCommand::with_name("compute")
