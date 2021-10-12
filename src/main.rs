@@ -28,7 +28,7 @@ use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
 
 extern crate indicatif;
 // use indicatif::{ProgressIterator, ParallelProgressIterator};
-use indicatif::ProgressIterator;
+use indicatif::{ProgressBar, ParallelProgressIterator};
 
 extern crate thread_local;
 use thread_local::ThreadLocal;
@@ -37,13 +37,16 @@ extern crate num_traits;
 use num_traits::identities::Zero;
 
 extern crate clap;
-use clap::{Arg, App, SubCommand};
+use clap::{Arg, App, AppSettings, SubCommand};
 
 extern crate tempfile;
 use tempfile::tempfile;
 
 extern crate rayon;
 use rayon::prelude::*;
+
+extern crate partial_sort;
+use partial_sort::PartialSort;
 
 // Wrapper for __m256
 #[derive(Clone, Copy, Debug)]
@@ -53,8 +56,6 @@ struct F32x8 {
 
 impl F32x8 {
     fn from_slice(xs: &[f32; 8]) -> Self {
-        // this segfault, not sure why
-        // return F32x8{x: unsafe { *transmute::<&[f32; 8], &__m256>(xs) } };
         return F32x8{x: unsafe { _mm256_set_ps(xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]) } };
     }
 
@@ -196,9 +197,7 @@ fn correlation_matrix(
     let buffers: Arc<ThreadLocal<Mutex<Vec<(i32, i32, f32)>>>> = Arc::new(ThreadLocal::new());
     let tmpfile = Arc::new(Mutex::new(tmpfile));
 
-    // TODO: fancy progress bar
-
-    x.par_chunks_exact(n_avx).zip(norms).enumerate().for_each(|(i, (u, u_norm))| {
+    x.par_chunks_exact(n_avx).zip(norms).enumerate().progress().for_each(|(i, (u, u_norm))| {
         let buffer = buffers.clone();
 
         ((i+1)..m).zip(x[(i+1)*n_avx..].chunks_exact(n_avx).zip(norms[(i+1)..].iter())).for_each(|(j, (v, v_norm))| {
@@ -250,17 +249,17 @@ fn read_temporary_entries(input: &mut File, nnz: usize) -> (Vec<i32>, Vec<i32>, 
 
     let mut i_idx = Vec::<i32>::with_capacity(nnz);
     let mut j_idx = Vec::<i32>::with_capacity(nnz);
-    let mut v_idx = Vec::<f32>::with_capacity(nnz);
+    let mut vs = Vec::<f32>::with_capacity(nnz);
 
     println!("reading back {} matrix entries...", nnz);
     for _ in 0..nnz {
         i_idx.push(input.read_i32::<BigEndian>().unwrap());
         j_idx.push(input.read_i32::<BigEndian>().unwrap());
-        v_idx.push(input.read_f32::<BigEndian>().unwrap());
+        vs.push(input.read_f32::<BigEndian>().unwrap());
     }
     println!("done.");
 
-    return (i_idx, j_idx, v_idx);
+    return (i_idx, j_idx, vs);
 }
 
 
@@ -276,9 +275,9 @@ fn write_temporary_entries(output: &mut File, buffer: &Vec<(i32, i32, f32)>) {
 
 
 // Output correlation matrix in COO format to an HDF5 file
-fn write_correlation_matrix(filename: &str, i_idx: &Vec<i32>, j_idx: &Vec<i32>, v_idx: &Vec<f32>) -> hdf5::Result<()>  {
+fn write_correlation_matrix(filename: &str, i_idx: &Vec<i32>, j_idx: &Vec<i32>, vs: &Vec<f32>) -> hdf5::Result<()>  {
     assert!(i_idx.len() == j_idx.len());
-    assert!(j_idx.len() == v_idx.len());
+    assert!(j_idx.len() == vs.len());
     let nnz = i_idx.len();
     let output = hdf5::File::create(filename)?;
     let i_ds = output.new_dataset::<i32>().create("I", nnz)?;
@@ -286,9 +285,26 @@ fn write_correlation_matrix(filename: &str, i_idx: &Vec<i32>, j_idx: &Vec<i32>, 
     let j_ds = output.new_dataset::<i32>().create("J", nnz)?;
     j_ds.write(j_idx)?;
     let v_ds = output.new_dataset::<f32>().create("V", nnz)?;
-    v_ds.write(v_idx)?;
+    v_ds.write(vs)?;
 
     return Ok(());
+}
+
+
+fn read_correlation_matrix(filename: &str) -> hdf5::Result<(Vec<i32>, Vec<i32>, Vec<f32>)> {
+
+    let file = hdf5::File::open(filename)?;
+
+    let i_ds = file.dataset("I")?;
+    let i_idx = i_ds.read_raw()?;
+
+    let j_ds = file.dataset("J")?;
+    let j_idx = j_ds.read_raw()?;
+
+    let v_ds = file.dataset("V")?;
+    let vs = v_ds.read_raw()?;
+
+    return Ok((i_idx, j_idx, vs))
 }
 
 
@@ -296,6 +312,7 @@ fn main() {
     // TODO: What are we actually calling this thing?
     let matches = App::new("")
         .about("Brute-force computation of correlation matrices.")
+        .setting(AppSettings::ArgRequiredElseHelp)
         .subcommand(SubCommand::with_name("compute")
             .arg(Arg::with_name("input")
                 .help("Feature matrix in HDF5 format.")
@@ -309,6 +326,7 @@ fn main() {
                 .index(2))
             .arg(Arg::with_name("lower-bound")
                 .help("Suppress abs correlations below this number.")
+                .long("lower-bound")
                 .takes_value(true)
                 .value_name("C"))
             .arg(Arg::with_name("temp")
@@ -319,9 +337,19 @@ fn main() {
                 .help("Number of threads to use.")
                 .takes_value(true)
                 .value_name("THREADS")))
-        .subcommand(SubCommand::with_name("topk"))
+        .subcommand(SubCommand::with_name("topk")
+            .help("Print the top-k correlations (or anti-correlations)")
+            .arg(Arg::with_name("k")
+                .help("Maximum number of correlated pairs to print.")
+                .required(true)
+                .value_name("K")
+                .index(1))
+            .arg(Arg::with_name("input")
+                .help("Sparse COO correlation matrix in HDF5 format (generated by the `compute` command).")
+                .value_name("correlations.h5")
+                .required(true)
+                .index(2)))
         .get_matches();
-
 
     if let Some(matches) = matches.subcommand_matches("compute") {
         let input_filename = matches.value_of("input").unwrap();
@@ -338,20 +366,28 @@ fn main() {
             tempfile().unwrap()
         };
 
-        println!("here");
         let (x, m, n, n_avx) = read_feature_matrix(input_filename).unwrap();
         let norms = l2norms(&x, n_avx);
         println!("Input matrix: {} features, {} observations", m, n);
 
-        let (i_idx, j_idx, v_idx) = correlation_matrix(&x, &norms, n_avx, &mut tmpfile, lower_bound);
-        write_correlation_matrix(output_filename, &i_idx, &j_idx, &v_idx).unwrap();
+        let (i_idx, j_idx, vs) = correlation_matrix(&x, &norms, n_avx, &mut tmpfile, lower_bound);
+        write_correlation_matrix(output_filename, &i_idx, &j_idx, &vs).unwrap();
 
     } else if let Some(matches) = matches.subcommand_matches("topk") {
-        // TODO:
-        //  - Read hdf5 sparse correlation matrix.
-        //  - To partial proxy sort.
-        //  - Report results to csv
+        let input_filename = matches.value_of("input").unwrap();
+        let k = matches.value_of("k").unwrap().parse::<usize>().unwrap();
+
+        let (i_idx, j_idx, vs) = read_correlation_matrix(input_filename).unwrap();
+
+        let nnz = vs.len();
+
+        let mut perm: Vec<usize> = (0..nnz).collect();
+        perm.partial_sort(k.min(nnz), |i, j| vs[*j].abs().partial_cmp(&vs[*i].abs()).unwrap() );
+
+        for p in perm[0..k.min(nnz)].iter() {
+            println!("{},{},{}", i_idx[*p], j_idx[*p], vs[*p]);
+        }
     } else {
-        // TODO: error
+        panic!("Subcommand must be used.")
     }
 }
