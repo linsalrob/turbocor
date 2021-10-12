@@ -27,8 +27,7 @@ extern crate byteorder;
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
 
 extern crate indicatif;
-// use indicatif::{ProgressIterator, ParallelProgressIterator};
-use indicatif::{ProgressBar, ParallelProgressIterator};
+use indicatif::{ProgressBar, ProgressStyle, ParallelProgressIterator};
 
 extern crate thread_local;
 use thread_local::ThreadLocal;
@@ -115,11 +114,15 @@ impl Zero for F32x8 {
 
 
 // Read HDF5 feature matrix into a padded AVX (F32x8) matrix.
-fn read_feature_matrix(filename: &str) -> hdf5::Result<(Vec<F32x8>, usize, usize, usize)> {
+fn read_feature_matrix(
+        filename: &str, dataset_name: &str, transpose: bool) -> hdf5::Result<(Vec<F32x8>, usize, usize, usize)> {
     let file = hdf5::File::open(filename)?;
-    let x_ds = file.dataset("X")?;
+    let x_ds = file.dataset(dataset_name)?;
 
     let mut x = x_ds.read_2d::<f32>()?;
+    if transpose {
+        x = x.reversed_axes();
+    }
 
     let m = x.shape()[0];
     let n = x.shape()[1];
@@ -134,8 +137,6 @@ fn read_feature_matrix(filename: &str) -> hdf5::Result<(Vec<F32x8>, usize, usize
     let n_avx = ((n-1) / 8)+1;
 
     let mut x_avx: Vec<F32x8> = vec![F32x8::zero(); m*n_avx];
-
-    // let mut x_avx = Array2::<F32x8>::zeros((m, n_avx));
     let mut buf: [f32; 8] = [0.0; 8];
 
     for (i, row) in x.outer_iter().enumerate() {
@@ -173,9 +174,7 @@ fn l2norms(x: &Vec<F32x8>, n_avx: usize) -> Vec<f32> {
 
 
 fn dot(u: &[F32x8], v: &[F32x8]) -> f32 {
-    let mut accum = F32x8::zero();
-    u.iter().zip(v).for_each(|(u_i, v_i)| { accum = u_i.fma(v_i, &accum) });
-    return accum.sum();
+    return u.iter().zip(v).fold(F32x8::zero(), |accum, (u_i, v_i)| { u_i.fma(v_i, &accum) }).sum();
 }
 
 
@@ -197,7 +196,11 @@ fn correlation_matrix(
     let buffers: Arc<ThreadLocal<Mutex<Vec<(i32, i32, f32)>>>> = Arc::new(ThreadLocal::new());
     let tmpfile = Arc::new(Mutex::new(tmpfile));
 
-    x.par_chunks_exact(n_avx).zip(norms).enumerate().progress().for_each(|(i, (u, u_norm))| {
+    let prog = ProgressBar::new(m as u64);
+    prog.set_style(ProgressStyle::default_bar()
+        .template("Computing correlation matrix: {bar:80} {eta_precise}"));
+
+    x.par_chunks_exact(n_avx).zip(norms).enumerate().progress_with(prog).for_each(|(i, (u, u_norm))| {
         let buffer = buffers.clone();
 
         ((i+1)..m).zip(x[(i+1)*n_avx..].chunks_exact(n_avx).zip(norms[(i+1)..].iter())).for_each(|(j, (v, v_norm))| {
@@ -328,6 +331,14 @@ fn main() {
                 .long("lower-bound")
                 .takes_value(true)
                 .value_name("C"))
+            .arg(Arg::with_name("dataset")
+                .help("Name of dataset in input HDF5 file.")
+                .long("dataset")
+                .takes_value(true)
+                .value_name("DATASET"))
+            .arg(Arg::with_name("transpose")
+                .help("Dataset matrix should be transposed")
+                .long("transpose"))
             .arg(Arg::with_name("temp")
                 .help("Path to temporary file to use.")
                 .takes_value(true)
@@ -354,6 +365,8 @@ fn main() {
         let input_filename = matches.value_of("input").unwrap();
         let output_filename = matches.value_of("output").unwrap();
         let lower_bound = matches.value_of("lower-bound").unwrap_or("0.8").parse::<f32>().unwrap();
+        let dataset_name = matches.value_of("dataset").unwrap_or("X");
+        let transpose = matches.is_present("transpose");
 
         println!("lower bound: {}", lower_bound);
 
@@ -365,7 +378,7 @@ fn main() {
             tempfile().unwrap()
         };
 
-        let (x, m, n, n_avx) = read_feature_matrix(input_filename).unwrap();
+        let (x, m, n, n_avx) = read_feature_matrix(input_filename, dataset_name, transpose).unwrap();
         let norms = l2norms(&x, n_avx);
         println!("Input matrix: {} features, {} observations", m, n);
 
