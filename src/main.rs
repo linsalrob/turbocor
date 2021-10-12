@@ -42,9 +42,8 @@ use clap::{Arg, App, SubCommand};
 extern crate tempfile;
 use tempfile::tempfile;
 
-extern crate ndarray;
-use ndarray::{Array2, ArrayView, Axis, Ix1, Zip};
-use ndarray::parallel::prelude::*;
+extern crate rayon;
+use rayon::prelude::*;
 
 // Wrapper for __m256
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +59,7 @@ impl F32x8 {
     }
 
     // Fused multiply-add computing self*v + b
+    #[inline(always)]
     fn fma(&self, v: &Self, b: &Self) -> F32x8 {
         return F32x8{x: unsafe { _mm256_fmadd_ps(self.x, v.x, b.x) }};
     }
@@ -114,7 +114,7 @@ impl Zero for F32x8 {
 
 
 // Read HDF5 feature matrix into a padded AVX (F32x8) matrix.
-fn read_feature_matrix(filename: &str) -> hdf5::Result<(Array2<F32x8>, usize, usize)> {
+fn read_feature_matrix(filename: &str) -> hdf5::Result<(Vec<F32x8>, usize, usize, usize)> {
     let file = hdf5::File::open(filename)?;
     let x_ds = file.dataset("X")?;
 
@@ -131,8 +131,10 @@ fn read_feature_matrix(filename: &str) -> hdf5::Result<(Array2<F32x8>, usize, us
 
     // Pad and convert to a f32x8 matrix
     let n_avx = ((n-1) / 8)+1;
-    dbg!(n_avx);
-    let mut x_avx = Array2::<F32x8>::zeros((m, n_avx));
+
+    let mut x_avx: Vec<F32x8> = vec![F32x8::zero(); m*n_avx];
+
+    // let mut x_avx = Array2::<F32x8>::zeros((m, n_avx));
     let mut buf: [f32; 8] = [0.0; 8];
 
     for (i, row) in x.outer_iter().enumerate() {
@@ -141,7 +143,7 @@ fn read_feature_matrix(filename: &str) -> hdf5::Result<(Array2<F32x8>, usize, us
             k = j % 8;
             buf[k] = *value;
             if k == 7 {
-                x_avx[[i, j/8]] = F32x8::from_slice(&buf);
+                x_avx[i*n_avx + j/8] = F32x8::from_slice(&buf);
             }
         }
 
@@ -150,64 +152,43 @@ fn read_feature_matrix(filename: &str) -> hdf5::Result<(Array2<F32x8>, usize, us
             for l in k+1..8 {
                 buf[l] = 0.0;
             }
-            x_avx[[i, (n-1)/8]] = F32x8::from_slice(&buf);
+            x_avx[i*n_avx + (n-1)/8] = F32x8::from_slice(&buf);
         }
     }
 
-    return Ok((x_avx, m, n));
+    return Ok((x_avx, m, n, n_avx));
 }
 
 
 // standard deviation of centered (zero-mean) rows
-fn l2norms(x: &Array2<F32x8>) -> Vec<f32> {
-    let mut norms: Vec<f32> = Vec::with_capacity(x.shape()[0]);
-    for row in x.rows() {
+fn l2norms(x: &Vec<F32x8>, n_avx: usize) -> Vec<f32> {
+    let m = x.len() / n_avx;
+    let mut norms: Vec<f32> = Vec::with_capacity(m);
+    for row in x.chunks_exact(n_avx) {
         norms.push(sum_squares(row).sqrt());
     }
     return norms;
 }
 
 
-// // Subtract the row means from each entry
-// fn center_feature_matrix(x: &mut Array2<F32x8>, m: usize, n: usize) {
-//     x.axis_iter_mut(Axis(0)).into_par_iter().for_each(|row| {
-//         let mu = row.fold(F32x8::zero(), |a, b| { a + *b }).sum() / (n as f32);
-//         // TODO: This is tricky! We don't wan't to un-zero the last entries.
-//         F32x8.fill
-
-//     });
-// }
-
-
-type RowVec<'a> = ArrayView<'a, F32x8, Ix1>;
-
-
-// dot product function using fmadd and and fancy horizontal sum
-fn dot<'a>(u: RowVec<'a>, v: RowVec<'a>) -> f32 {
+fn dot(u: &[F32x8], v: &[F32x8]) -> f32 {
     let mut accum = F32x8::zero();
-    Zip::from(u).and(v).for_each(|x, y| { accum = x.fma(y, &accum) });
+    u.iter().zip(v).for_each(|(u_i, v_i)| { accum = u_i.fma(v_i, &accum) });
     return accum.sum();
 }
 
-fn mean<'a>(u: RowVec<'a>, n: usize) -> f32 {
-    return u.fold(F32x8::zero(), |a, b| { a + *b }).sum() / (n as f32);
-}
 
-
-fn sum<'a>(u: RowVec<'a>) -> f32 {
-    return u.fold(F32x8::zero(), |a, b| { a + *b }).sum();
-}
-
-
-fn sum_squares<'a>(u: RowVec<'a>) -> f32 {
-    return u.fold(F32x8::zero(), |a, b| { a + (*b * *b) }).sum();
+fn sum_squares(u: &[F32x8]) -> f32 {
+    return u.iter().fold(F32x8::zero(), |a, b| { a + (*b * *b) }).sum();
 }
 
 
 // Compute a sparse correlation matrix
 fn correlation_matrix(
-        x: &Array2<F32x8>, norms: &Vec<f32>,
+        x: &Vec<F32x8>, norms: &Vec<f32>, n_avx: usize,
         tmpfile: &mut File, lower_bound: f32) -> (Vec<i32>, Vec<i32>, Vec<f32>) {
+
+    let m = x.len() / n_avx;
 
     // Each thread adds results to its own buffer. When a buffer is full, it locks
     // the temporary file and purges its buffer.
@@ -217,15 +198,10 @@ fn correlation_matrix(
 
     // TODO: fancy progress bar
 
-    x.axis_iter(Axis(0)).into_par_iter().zip(norms).enumerate().for_each(|(i, (u, u_norm))| {
+    x.par_chunks_exact(n_avx).zip(norms).enumerate().for_each(|(i, (u, u_norm))| {
         let buffer = buffers.clone();
 
-        x.axis_iter(Axis(0)).zip(norms).enumerate().for_each(|(j, (v, v_norm))| {
-            // only compute the upper triangular matrix
-            if j <= i {
-                return;
-            }
-
+        ((i+1)..m).zip(x[(i+1)*n_avx..].chunks_exact(n_avx).zip(norms[(i+1)..].iter())).for_each(|(j, (v, v_norm))| {
             let c = dot(u, v) / (u_norm * v_norm);
 
             if c.abs() < lower_bound {
@@ -240,7 +216,7 @@ fn correlation_matrix(
                 write_temporary_entries(*tmpfile, &buffer);
                 buffer.clear();
             }
-        })
+        });
     });
 
     // handle partially filled buffers
@@ -363,11 +339,11 @@ fn main() {
         };
 
         println!("here");
-        let (x, m, n) = read_feature_matrix(input_filename).unwrap();
-        let norms = l2norms(&x);
+        let (x, m, n, n_avx) = read_feature_matrix(input_filename).unwrap();
+        let norms = l2norms(&x, n_avx);
         println!("Input matrix: {} features, {} observations", m, n);
 
-        let (i_idx, j_idx, v_idx) = correlation_matrix(&x, &norms, &mut tmpfile, lower_bound);
+        let (i_idx, j_idx, v_idx) = correlation_matrix(&x, &norms, n_avx, &mut tmpfile, lower_bound);
         write_correlation_matrix(output_filename, &i_idx, &j_idx, &v_idx).unwrap();
 
     } else if let Some(matches) = matches.subcommand_matches("topk") {
