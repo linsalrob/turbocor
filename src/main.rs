@@ -127,10 +127,12 @@ fn read_feature_matrix(
     let m = x.shape()[0];
     let n = x.shape()[1];
 
-    // center by subtracting row-means
+    // center by subtracting row-means, then divide by row l2 norms
     x.outer_iter_mut().for_each(|mut row| {
         let mu = row.fold(0.0, |a, b| { a + b }) / (n as f32);
         row.iter_mut().for_each(|v| *v -= mu );
+        let l2 = row.fold(0.0, |accum, v| {accum + (v * v)} ).sqrt();
+        row.iter_mut().for_each(|v| *v /= l2 );
     });
 
     // Pad and convert to a f32x8 matrix
@@ -162,30 +164,14 @@ fn read_feature_matrix(
 }
 
 
-// standard deviation of centered (zero-mean) rows
-fn l2norms(x: &Vec<F32x8>, n_avx: usize) -> Vec<f32> {
-    let m = x.len() / n_avx;
-    let mut norms: Vec<f32> = Vec::with_capacity(m);
-    for row in x.chunks_exact(n_avx) {
-        norms.push(sum_squares(row).sqrt());
-    }
-    return norms;
-}
-
-
 fn dot(u: &[F32x8], v: &[F32x8]) -> f32 {
     return u.iter().zip(v).fold(F32x8::zero(), |accum, (u_i, v_i)| { u_i.fma(v_i, &accum) }).sum();
 }
 
 
-fn sum_squares(u: &[F32x8]) -> f32 {
-    return u.iter().fold(F32x8::zero(), |a, b| { a + (*b * *b) }).sum();
-}
-
-
 // Compute a sparse correlation matrix
 fn correlation_matrix(
-        x: &Vec<F32x8>, norms: &Vec<f32>, n_avx: usize,
+        x: &Vec<F32x8>, n_avx: usize,
         tmpfile: &mut File, lower_bound: f32) -> (Vec<i32>, Vec<i32>, Vec<f32>) {
 
     let m = x.len() / n_avx;
@@ -200,11 +186,11 @@ fn correlation_matrix(
     prog.set_style(ProgressStyle::default_bar()
         .template("Computing correlation matrix: {bar:80} {eta_precise}"));
 
-    x.par_chunks_exact(n_avx).zip(norms).enumerate().progress_with(prog).for_each(|(i, (u, u_norm))| {
+    x.par_chunks_exact(n_avx).enumerate().progress_with(prog).for_each(|(i, u)| {
         let buffer = buffers.clone();
 
-        ((i+1)..m).zip(x[(i+1)*n_avx..].chunks_exact(n_avx).zip(norms[(i+1)..].iter())).for_each(|(j, (v, v_norm))| {
-            let c = dot(u, v) / (u_norm * v_norm);
+        ((i+1)..m).zip(x[(i+1)*n_avx..].chunks_exact(n_avx)).for_each(|(j, v)| {
+            let c = dot(u, v);
 
             if c.abs() < lower_bound {
                 return
@@ -225,9 +211,7 @@ fn correlation_matrix(
     println!("flushing buffers...");
     let mut tmpfile = tmpfile.lock().unwrap();
     let buffers = Arc::try_unwrap(buffers).unwrap();
-    let mut buffer_count = 0;
     buffers.into_iter().for_each(|buffer| {
-        buffer_count += 1;
         let mut buffer = buffer.lock().unwrap();
         write_temporary_entries(*tmpfile, &buffer);
         buffer.clear();
@@ -379,10 +363,9 @@ fn main() {
         };
 
         let (x, m, n, n_avx) = read_feature_matrix(input_filename, dataset_name, transpose).unwrap();
-        let norms = l2norms(&x, n_avx);
         println!("Input matrix: {} features, {} observations", m, n);
 
-        let (i_idx, j_idx, vs) = correlation_matrix(&x, &norms, n_avx, &mut tmpfile, lower_bound);
+        let (i_idx, j_idx, vs) = correlation_matrix(&x, n_avx, &mut tmpfile, lower_bound);
         write_correlation_matrix(output_filename, &i_idx, &j_idx, &vs).unwrap();
 
     } else if let Some(matches) = matches.subcommand_matches("topk") {
