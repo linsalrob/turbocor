@@ -192,7 +192,7 @@ fn correlation_matrix(
         ((i+1)..m).zip(x[(i+1)*n_avx..].chunks_exact(n_avx)).for_each(|(j, v)| {
             let c = dot(u, v);
 
-            if c.abs() < lower_bound {
+            if c.abs() < lower_bound || c.is_nan() {
                 return
             }
 
